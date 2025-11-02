@@ -1,109 +1,105 @@
+// server.js
 const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+require("dotenv").config();
 
 const app = express();
-app.use(cors());
+app.use(cors()); // allow frontend to reach backend
 app.use(express.json());
 
-// In-memory "database"
-const users = [];
+const SECRET = process.env.JWT_SECRET || "supersecret";
 
-// Default gamemodes
-const gamemodes = ["sword", "axe", "uhc", "mace", "crystal", "smp", "pot", "neth pot"];
-
-// Tier points
-const tierPoints = {
-  lt5: 10, ht5: 20, lt4: 30, ht4: 40, lt3: 50,
-  ht3: 60, lt2: 70, ht2: 80, lt1: 90, ht1: 100
+// --- In-memory storage (replace with database later) ---
+let users = []; // { username, passwordHash, role }
+let gamemodes = ["sword", "axe", "uhc", "mace", "crystal", "smp", "pot", "neth pot"];
+let tiers = {
+  lt5: [],
+  ht5: [],
+  lt4: [],
+  ht4: [],
+  lt3: [],
+  ht3: [],
+  lt2: [],
+  ht2: [],
+  lt1: [],
+  ht1: [],
 };
 
-// Root route
-app.get("/", (req, res) => res.send("MCTiers backend running!"));
+// --- Helper to verify token ---
+function verifyToken(req, res, next) {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) return res.status(401).json({ error: "No token provided" });
 
-// --- Auth routes ---
+  try {
+    const decoded = jwt.verify(token, SECRET);
+    req.user = decoded;
+    next();
+  } catch {
+    res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+// --- Routes ---
+
+// Register
 app.post("/api/auth/register", async (req, res) => {
   const { username, password, role } = req.body;
-  if (!username || !password || !role) return res.status(400).json({ error: "Missing fields" });
+  if (users.find(u => u.username === username))
+    return res.status(400).json({ error: "Username already exists" });
 
-  if (users.find(u => u.username === username)) return res.status(400).json({ error: "User already exists" });
+  const passwordHash = await bcrypt.hash(password, 10);
+  users.push({ username, passwordHash, role });
+  const token = jwt.sign({ username, role }, SECRET, { expiresIn: "1d" });
 
-  const hashed = await bcrypt.hash(password, 10);
-  users.push({ username, password: hashed, role, tiers: {} });
-  res.json({ message: "User registered" });
+  res.json({ message: "Registered successfully", token });
 });
 
+// Login
 app.post("/api/auth/login", async (req, res) => {
   const { username, password } = req.body;
   const user = users.find(u => u.username === username);
-  if (!user) return res.status(400).json({ error: "User not found" });
+  if (!user) return res.status(400).json({ error: "Invalid credentials" });
 
-  const valid = await bcrypt.compare(password, user.password);
-  if (!valid) return res.status(400).json({ error: "Wrong password" });
+  const match = await bcrypt.compare(password, user.passwordHash);
+  if (!match) return res.status(400).json({ error: "Invalid credentials" });
 
-  const token = jwt.sign({ username, role: user.role }, "secret", { expiresIn: "1h" });
-  res.json({ token });
+  const token = jwt.sign({ username, role: user.role }, SECRET, { expiresIn: "1d" });
+  res.json({ message: "Logged in successfully", token });
 });
 
-// --- Gamemodes ---
-app.get("/api/gamemodes", (req, res) => res.json(gamemodes));
+// Get gamemodes
+app.get("/api/gamemodes", (req, res) => {
+  res.json(gamemodes);
+});
 
-// --- Tiers ---
+// Get tiers + overall points
 app.get("/api/tiers", (req, res) => {
-  const sampleTiers = {};
-  gamemodes.forEach(mode => sampleTiers[mode] = "lt5"); // default
-
-  const tierWithPoints = {};
-  let overallPoints = 0;
-  for (const [mode, tier] of Object.entries(sampleTiers)) {
-    const points = tierPoints[tier] || 0;
-    tierWithPoints[mode] = { tier, points };
-    overallPoints += points;
+  const tierPoints = { lt5: 10, ht5: 20, lt4: 30, ht4: 40, lt3: 50, ht3: 60, lt2: 70, ht2: 80, lt1: 90, ht1: 100 };
+  const overallPoints = {};
+  for (const [tier, players] of Object.entries(tiers)) {
+    players.forEach(player => {
+      overallPoints[player] = (overallPoints[player] || 0) + tierPoints[tier];
+    });
   }
 
-  res.json({ tiers: tierWithPoints, overallPoints });
+  res.json({ tiers, overallPoints });
 });
 
-// --- Auth middleware ---
-const authenticate = (req, res, next) => {
-  const token = req.headers.authorization?.split(" ")[1];
-  if (!token) return res.status(401).json({ error: "No token" });
+// Update tiers (owner only)
+app.patch("/api/tiers", verifyToken, (req, res) => {
+  if (req.user.role !== "owner") return res.status(403).json({ error: "Not allowed" });
 
-  try {
-    const user = jwt.verify(token, "secret");
-    req.user = user;
-    next();
-  } catch (err) {
-    res.status(401).json({ error: "Invalid token" });
-  }
-};
+  const { updatedTiers } = req.body;
+  if (!updatedTiers) return res.status(400).json({ error: "No tiers provided" });
 
-// --- MOD: Edit user tiers ---
-app.put("/api/tiers/:username", authenticate, (req, res) => {
-  if (!["mod","owner"].includes(req.user.role)) return res.status(403).json({ error: "Unauthorized" });
-
-  const { username } = req.params;
-  const { tiers } = req.body;
-  const user = users.find(u => u.username === username);
-  if (!user) return res.status(404).json({ error: "User not found" });
-
-  user.tiers = tiers;
-  res.json({ message: "Tiers updated", tiers: user.tiers });
+  tiers = updatedTiers;
+  res.json({ message: "Tiers updated successfully", tiers });
 });
 
-// --- OWNER: Edit gamemodes ---
-app.put("/api/gamemodes", authenticate, (req, res) => {
-  if (req.user.role !== "owner") return res.status(403).json({ error: "Unauthorized" });
-
-  const { newGamemodes } = req.body;
-  if (!Array.isArray(newGamemodes)) return res.status(400).json({ error: "Invalid gamemodes" });
-
-  gamemodes.length = 0;
-  gamemodes.push(...newGamemodes);
-  res.json({ message: "Gamemodes updated", gamemodes });
-});
-
-// Start server
+// --- Start server ---
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
